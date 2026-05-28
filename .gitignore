@@ -1,0 +1,15 @@
+# User data / secrets
+cookies.txt
+fb_downloader_settings.json
+downloads/
+*.sqlite3
+
+# Build artifacts
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# Legacy data
+speak english daily.csv
