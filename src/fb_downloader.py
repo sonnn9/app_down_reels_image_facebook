@@ -53,6 +53,10 @@ DEFAULT_SETTINGS = {
     "output_dir": str(DEFAULT_DOWNLOADS),
     "cookies_path": str(DEFAULT_COOKIES),
     "download_videos_with_images": False,
+    "reels_mode": "video",  # "video" | "mp3" | "both"
+    "transcribe_srt": False,      # tach script bang Whisper -> .srt
+    "whisper_model": "turbo",     # ten model Whisper (turbo = large-v3-turbo)
+    "whisper_language": "",       # "" = tu dong nhan dien; vd "vi", "en"
     "image_links": "",
     "reels_links": "",
 }
@@ -101,6 +105,20 @@ def parse_links(text: str) -> list[str]:
 # ---------- Subprocess flags (no console window on Windows) ----------
 
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+FFMPEG_EXE = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+
+
+def find_ffmpeg_dir() -> Path | None:
+    """Locate a folder containing ffmpeg to hand to yt-dlp via --ffmpeg-location.
+
+    Search order: next to the exe, an adjacent `bin/` folder, then give up and let
+    yt-dlp fall back to whatever is on PATH.
+    """
+    for cand in (CONFIG_DIR, CONFIG_DIR / "bin"):
+        if (cand / FFMPEG_EXE).exists():
+            return cand
+    return None
 
 
 def ensure_gallery_conf() -> Path:
@@ -204,6 +222,25 @@ class DownloadJob:
         out_dir.mkdir(parents=True, exist_ok=True)
         cmd_base = self._ytdlp_invoker()
         cookies = Path(self.settings["cookies_path"])
+        mode = self.settings.get("reels_mode", "video")
+
+        transcribe = bool(self.settings.get("transcribe_srt"))
+
+        mode_label = {"video": "chi video", "mp3": "chi MP3", "both": "video + MP3"}.get(mode, mode)
+        self.emit(f"[MODE] Che do tai: {mode_label}. Ten file theo title video.")
+
+        ffmpeg_dir = find_ffmpeg_dir()
+        if mode in ("mp3", "both"):
+            if ffmpeg_dir:
+                self.emit(f"[FFMPEG] Dung ffmpeg tai: {ffmpeg_dir}")
+            else:
+                self.emit("[NOTE] Khong thay ffmpeg.exe canh app -> dung ffmpeg trong PATH. "
+                          "Neu loi MP3, copy ffmpeg.exe (va ffprobe.exe) vao canh file exe.")
+        if transcribe:
+            self.emit(f"[WHISPER] Se tach script ra .srt (model: {self.settings.get('whisper_model', 'turbo')}).")
+
+        # File tam de yt-dlp ghi lai duong dan cac file da tai (moi dong 1 file).
+        paths_file = out_dir / ".fbdl_lastpaths.txt"
 
         # Run all links in one yt-dlp invocation (faster, cleaner archive handling)
         # but still loop per-link so user can stop mid-way.
@@ -214,13 +251,32 @@ class DownloadJob:
             self.emit(f"")
             self.emit(f"[{i}/{len(self.links)}] {url}")
 
+            try:
+                paths_file.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+
             cmd = list(cmd_base) + [
                 "--ignore-config",
                 "-P", str(out_dir),
-                "-o", "%(id)s.%(ext)s",
+                # Ten file dua tren title video (trim de tranh vuot gioi han Windows).
+                "-o", "%(title).150B [%(id)s].%(ext)s",
                 "--windows-filenames",
                 "--no-download-archive",
+                # Ghi duong dan file cuoi cung ra file tam de con biet ma tach script.
+                "--print-to-file", "after_move:filepath", str(paths_file),
             ]
+            if mode == "mp3":
+                # Chi lay am thanh, chuyen sang MP3.
+                cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
+            elif mode == "both":
+                # Tai video, dong thoi tach ra file MP3 (giu ca hai).
+                cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0", "--keep-video"]
+            # mode == "video": mac dinh tai video (best video+audio).
+            if mode in ("mp3", "both") and ffmpeg_dir:
+                cmd += ["--ffmpeg-location", str(ffmpeg_dir)]
             if cookies.exists():
                 cmd += ["--cookies", str(cookies)]
             cmd += [url]
@@ -228,9 +284,99 @@ class DownloadJob:
             rc = self._spawn(cmd)
             if rc == 0:
                 self.ok += 1
+                if transcribe and not self._stop.is_set():
+                    for media in self._read_downloaded_paths(paths_file):
+                        self._transcribe_file(media, out_dir, ffmpeg_dir)
             else:
                 self.fail += 1
                 self.emit(f"  -> exit code {rc}")
+
+        try:
+            paths_file.unlink()
+        except Exception:
+            pass
+
+    # ---- transcription (openai-whisper) ----
+    def _read_downloaded_paths(self, paths_file: Path) -> list[Path]:
+        """Doc file tam yt-dlp ghi ra, tra ve danh sach file media ton tai (khong trung)."""
+        out: list[Path] = []
+        try:
+            lines = paths_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return out
+        seen = set()
+        for ln in lines:
+            p = ln.strip().strip('"')
+            if not p:
+                continue
+            fp = Path(p)
+            key = str(fp).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if fp.exists():
+                out.append(fp)
+        return out
+
+    def _load_whisper_model(self):
+        """Nap model Whisper mot lan roi cache lai tren job."""
+        cached = getattr(self, "_whisper_model", None)
+        if cached is not None:
+            return cached
+        try:
+            import whisper  # openai-whisper
+        except Exception as e:
+            self.emit(f"[WHISPER][ERR] Chua cai openai-whisper ({e!r}). "
+                      "Chay: pip install -U openai-whisper")
+            self._whisper_model = False
+            return None
+        name = self.settings.get("whisper_model", "turbo") or "turbo"
+        self.emit(f"[WHISPER] Dang nap model '{name}' (lan dau se tai ~1.5GB, vui long doi)...")
+        try:
+            model = whisper.load_model(name)
+        except Exception as e:
+            self.emit(f"[WHISPER][ERR] Khong nap duoc model '{name}': {e!r}")
+            self._whisper_model = False
+            return None
+        self.emit("[WHISPER] Nap model xong.")
+        self._whisper_model = model
+        return model
+
+    def _transcribe_file(self, media: Path, out_dir: Path, ffmpeg_dir: Path | None) -> None:
+        srt_path = media.with_suffix(".srt")
+        if srt_path.exists():
+            self.emit(f"[WHISPER] Da co san: {srt_path.name} (bo qua).")
+            return
+        model = self._load_whisper_model()
+        if not model:
+            return
+        # whisper goi ffmpeg qua PATH; neu ffmpeg dat canh app thi them vao PATH tam thoi.
+        if ffmpeg_dir:
+            os.environ["PATH"] = str(ffmpeg_dir) + os.pathsep + os.environ.get("PATH", "")
+        self.emit(f"[WHISPER] Tach script: {media.name} ...")
+        try:
+            import torch  # noqa
+            fp16 = bool(torch.cuda.is_available())
+        except Exception:
+            fp16 = False
+        lang = (self.settings.get("whisper_language") or "").strip() or None
+        try:
+            result = model.transcribe(str(media), language=lang, fp16=fp16, verbose=False)
+        except Exception as e:
+            self.emit(f"[WHISPER][ERR] Loi khi tach '{media.name}': {e!r}")
+            return
+        try:
+            from whisper.utils import get_writer
+            writer = get_writer("srt", str(media.parent))
+            writer(result, str(media), {
+                "max_line_width": None,
+                "max_line_count": None,
+                "highlight_words": False,
+            })
+            self.emit(f"[WHISPER] Xong -> {srt_path.name} "
+                      f"(ngon ngu: {result.get('language', '?')}).")
+        except Exception as e:
+            self.emit(f"[WHISPER][ERR] Loi khi ghi SRT cho '{media.name}': {e!r}")
 
     # ---- shared spawn ----
     def _spawn(self, cmd: list[str]) -> int:
@@ -352,6 +498,30 @@ class App(tk.Tk):
         else:
             self.reels_text = txt
 
+        if kind == "reels":
+            mode_frame = ttk.LabelFrame(parent, text="Tai gi?")
+            mode_frame.pack(fill="x", padx=10, pady=(0, 4))
+            self.reels_mode_var = tk.StringVar(value=self.settings.get("reels_mode", "video"))
+            ttk.Radiobutton(mode_frame, text="Chi video (mp4)",
+                            variable=self.reels_mode_var, value="video").pack(side="left", padx=(8, 12), pady=4)
+            ttk.Radiobutton(mode_frame, text="Chi MP3 (am thanh)",
+                            variable=self.reels_mode_var, value="mp3").pack(side="left", padx=(0, 12), pady=4)
+            ttk.Radiobutton(mode_frame, text="Ca video + MP3",
+                            variable=self.reels_mode_var, value="both").pack(side="left", padx=(0, 12), pady=4)
+
+            script_frame = ttk.LabelFrame(parent, text="Tach script (Whisper)")
+            script_frame.pack(fill="x", padx=10, pady=(0, 4))
+            self.transcribe_var = tk.BooleanVar(value=self.settings.get("transcribe_srt", False))
+            ttk.Checkbutton(script_frame, text="Tach loi thoai ra .srt bang Whisper turbo",
+                            variable=self.transcribe_var).pack(side="left", padx=(8, 12), pady=4)
+            ttk.Label(script_frame, text="Ngon ngu:").pack(side="left", padx=(6, 2))
+            self.whisper_lang_var = tk.StringVar(value=self.settings.get("whisper_language", ""))
+            lang_cb = ttk.Combobox(script_frame, textvariable=self.whisper_lang_var, width=14,
+                                   state="readonly",
+                                   values=["", "vi", "en", "ja", "ko", "zh", "fr", "es"])
+            lang_cb.pack(side="left", padx=(0, 6))
+            ttk.Label(script_frame, text="(de trong = tu dong)").pack(side="left")
+
         bar = ttk.Frame(parent)
         bar.pack(fill="x", padx=10, pady=(4, 10))
 
@@ -437,6 +607,9 @@ class App(tk.Tk):
         s["output_dir"] = self.out_var.get().strip() or str(DEFAULT_DOWNLOADS)
         s["cookies_path"] = self.cookies_var.get().strip() or str(DEFAULT_COOKIES)
         s["download_videos_with_images"] = bool(self.videos_var.get())
+        s["reels_mode"] = self.reels_mode_var.get()
+        s["transcribe_srt"] = bool(self.transcribe_var.get())
+        s["whisper_language"] = self.whisper_lang_var.get().strip()
         s["image_links"] = self.img_text.get("1.0", "end-1c")
         s["reels_links"] = self.reels_text.get("1.0", "end-1c")
         return s

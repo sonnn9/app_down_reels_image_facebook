@@ -21,17 +21,23 @@ if exist dist  rmdir /s /q dist
 if exist FB_Downloader.spec del /q FB_Downloader.spec
 
 echo.
-echo ==^> Build EXE (single file, no console)...
+echo ==^> Build (onedir vi co PyTorch/Whisper, no console)...
 "%PYTHON%" -m PyInstaller ^
     --noconfirm ^
-    --onefile ^
+    --onedir ^
     --windowed ^
     --name "FB_Downloader" ^
     --add-data "gallery-dl.conf;." ^
     --collect-all gallery_dl ^
     --collect-all yt_dlp ^
+    --collect-all whisper ^
+    --collect-all tiktoken ^
+    --collect-all tiktoken_ext ^
+    --collect-all torch ^
+    --collect-all numba ^
     --hidden-import gallery_dl ^
     --hidden-import yt_dlp ^
+    --hidden-import whisper ^
     src\fb_downloader.py
 
 if errorlevel 1 (
@@ -41,8 +47,8 @@ if errorlevel 1 (
 )
 
 echo.
-echo ==^> Xong! File: dist\FB_Downloader.exe
+echo ==^> Xong! Thu muc: dist\FB_Downloader\  (chay FB_Downloader.exe ben trong)
 echo.
-dir /b dist
+dir /b dist\FB_Downloader
 echo.
 pause

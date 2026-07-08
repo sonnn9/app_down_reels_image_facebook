@@ -17,11 +17,22 @@ App GUI tải **ảnh** và **Reels/Video** từ Facebook. Đóng gói thành 1 
 3. **Chạy `FB_Downloader.exe`**.
 4. Trong app:
    - Tab **Ảnh**: dán link FB (ảnh/album/profile/post), mỗi dòng 1 link → bấm **Bắt đầu tải**.
-   - Tab **Reels / Video**: dán link reels/video → bấm **Bắt đầu tải**.
+   - Tab **Reels / Video**: dán link reels/video → chọn **Tải gì?** (Chỉ video / Chỉ MP3 / Cả hai) → bấm **Bắt đầu tải**. Tên file đặt theo **title** của video.
    - Tab **Cài đặt**: đổi thư mục lưu, đường dẫn `cookies.txt`, bật tùy chọn tải video kèm ảnh.
    - Bấm **Mở thư mục tải về** để xem kết quả.
 
 Link và cài đặt được tự lưu vào `fb_downloader_settings.json` cạnh exe, lần sau mở lại không phải dán lại.
+
+> **Tải MP3 cần ffmpeg.** Chế độ *Chỉ MP3* và *Cả hai* dùng ffmpeg để tách/chuyển âm thanh. App tự dò `ffmpeg.exe` (và `ffprobe.exe`) theo thứ tự: cạnh file exe → thư mục `bin/` cạnh exe → `PATH` của máy. Nếu máy đích chưa có ffmpeg, tải bản Windows từ https://www.gyan.dev/ffmpeg/builds/ rồi copy `ffmpeg.exe` + `ffprobe.exe` vào cạnh `FB_Downloader.exe`. Chế độ *Chỉ video* không cần ffmpeg.
+
+### Tách script (Whisper)
+
+Trong tab **Reels / Video**, tick **"Tách lời thoại ra .srt bằng Whisper turbo"** để sau khi tải xong, app tự chạy [OpenAI Whisper](https://github.com/openai/whisper) (model `turbo` = `large-v3-turbo`) tách lời thoại thành file phụ đề `.srt` cùng tên với file media.
+
+- Chọn **Ngôn ngữ** nếu biết trước (vd `vi`, `en`); để trống = tự động nhận diện.
+- **Lần đầu** dùng sẽ tải model `turbo` (~1.5 GB) về cache (`%USERPROFILE%\.cache\whisper`), cần mạng. Các lần sau dùng lại cache, không tải nữa.
+- Whisper cũng cần **ffmpeg** để đọc audio (đã nói ở trên).
+- Chạy trên CPU (bản đóng gói không kèm CUDA) nên clip dài sẽ mất thời gian.
 
 ### Định dạng link hỗ trợ
 
