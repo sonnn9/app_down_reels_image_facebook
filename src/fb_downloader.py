@@ -5,9 +5,11 @@ FB Downloader - GUI tool tai anh va reels tu Facebook.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -54,9 +56,9 @@ DEFAULT_SETTINGS = {
     "cookies_path": str(DEFAULT_COOKIES),
     "download_videos_with_images": False,
     "reels_mode": "video",  # "video" | "mp3" | "both"
-    "transcribe_srt": False,      # tach script bang Whisper -> .srt
     "whisper_model": "turbo",     # ten model Whisper (turbo = large-v3-turbo)
     "whisper_language": "",       # "" = tu dong nhan dien; vd "vi", "en"
+    "srt_folder": "",             # thu muc chua file MP3 de tach SRT (tab rieng)
     "image_links": "",
     "reels_links": "",
 }
@@ -224,8 +226,6 @@ class DownloadJob:
         cookies = Path(self.settings["cookies_path"])
         mode = self.settings.get("reels_mode", "video")
 
-        transcribe = bool(self.settings.get("transcribe_srt"))
-
         mode_label = {"video": "chi video", "mp3": "chi MP3", "both": "video + MP3"}.get(mode, mode)
         self.emit(f"[MODE] Che do tai: {mode_label}. Ten file theo title video.")
 
@@ -236,27 +236,13 @@ class DownloadJob:
             else:
                 self.emit("[NOTE] Khong thay ffmpeg.exe canh app -> dung ffmpeg trong PATH. "
                           "Neu loi MP3, copy ffmpeg.exe (va ffprobe.exe) vao canh file exe.")
-        if transcribe:
-            self.emit(f"[WHISPER] Se tach script ra .srt (model: {self.settings.get('whisper_model', 'turbo')}).")
 
-        # File tam de yt-dlp ghi lai duong dan cac file da tai (moi dong 1 file).
-        paths_file = out_dir / ".fbdl_lastpaths.txt"
-
-        # Run all links in one yt-dlp invocation (faster, cleaner archive handling)
-        # but still loop per-link so user can stop mid-way.
         for i, url in enumerate(self.links, 1):
             if self._stop.is_set():
                 self.emit("[STOP] Da dung theo yeu cau.")
                 return
             self.emit(f"")
             self.emit(f"[{i}/{len(self.links)}] {url}")
-
-            try:
-                paths_file.unlink()
-            except FileNotFoundError:
-                pass
-            except Exception:
-                pass
 
             cmd = list(cmd_base) + [
                 "--ignore-config",
@@ -265,8 +251,6 @@ class DownloadJob:
                 "-o", "%(title).150B [%(id)s].%(ext)s",
                 "--windows-filenames",
                 "--no-download-archive",
-                # Ghi duong dan file cuoi cung ra file tam de con biet ma tach script.
-                "--print-to-file", "after_move:filepath", str(paths_file),
             ]
             if mode == "mp3":
                 # Chi lay am thanh, chuyen sang MP3.
@@ -284,99 +268,9 @@ class DownloadJob:
             rc = self._spawn(cmd)
             if rc == 0:
                 self.ok += 1
-                if transcribe and not self._stop.is_set():
-                    for media in self._read_downloaded_paths(paths_file):
-                        self._transcribe_file(media, out_dir, ffmpeg_dir)
             else:
                 self.fail += 1
                 self.emit(f"  -> exit code {rc}")
-
-        try:
-            paths_file.unlink()
-        except Exception:
-            pass
-
-    # ---- transcription (openai-whisper) ----
-    def _read_downloaded_paths(self, paths_file: Path) -> list[Path]:
-        """Doc file tam yt-dlp ghi ra, tra ve danh sach file media ton tai (khong trung)."""
-        out: list[Path] = []
-        try:
-            lines = paths_file.read_text(encoding="utf-8", errors="replace").splitlines()
-        except Exception:
-            return out
-        seen = set()
-        for ln in lines:
-            p = ln.strip().strip('"')
-            if not p:
-                continue
-            fp = Path(p)
-            key = str(fp).lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            if fp.exists():
-                out.append(fp)
-        return out
-
-    def _load_whisper_model(self):
-        """Nap model Whisper mot lan roi cache lai tren job."""
-        cached = getattr(self, "_whisper_model", None)
-        if cached is not None:
-            return cached
-        try:
-            import whisper  # openai-whisper
-        except Exception as e:
-            self.emit(f"[WHISPER][ERR] Chua cai openai-whisper ({e!r}). "
-                      "Chay: pip install -U openai-whisper")
-            self._whisper_model = False
-            return None
-        name = self.settings.get("whisper_model", "turbo") or "turbo"
-        self.emit(f"[WHISPER] Dang nap model '{name}' (lan dau se tai ~1.5GB, vui long doi)...")
-        try:
-            model = whisper.load_model(name)
-        except Exception as e:
-            self.emit(f"[WHISPER][ERR] Khong nap duoc model '{name}': {e!r}")
-            self._whisper_model = False
-            return None
-        self.emit("[WHISPER] Nap model xong.")
-        self._whisper_model = model
-        return model
-
-    def _transcribe_file(self, media: Path, out_dir: Path, ffmpeg_dir: Path | None) -> None:
-        srt_path = media.with_suffix(".srt")
-        if srt_path.exists():
-            self.emit(f"[WHISPER] Da co san: {srt_path.name} (bo qua).")
-            return
-        model = self._load_whisper_model()
-        if not model:
-            return
-        # whisper goi ffmpeg qua PATH; neu ffmpeg dat canh app thi them vao PATH tam thoi.
-        if ffmpeg_dir:
-            os.environ["PATH"] = str(ffmpeg_dir) + os.pathsep + os.environ.get("PATH", "")
-        self.emit(f"[WHISPER] Tach script: {media.name} ...")
-        try:
-            import torch  # noqa
-            fp16 = bool(torch.cuda.is_available())
-        except Exception:
-            fp16 = False
-        lang = (self.settings.get("whisper_language") or "").strip() or None
-        try:
-            result = model.transcribe(str(media), language=lang, fp16=fp16, verbose=False)
-        except Exception as e:
-            self.emit(f"[WHISPER][ERR] Loi khi tach '{media.name}': {e!r}")
-            return
-        try:
-            from whisper.utils import get_writer
-            writer = get_writer("srt", str(media.parent))
-            writer(result, str(media), {
-                "max_line_width": None,
-                "max_line_count": None,
-                "highlight_words": False,
-            })
-            self.emit(f"[WHISPER] Xong -> {srt_path.name} "
-                      f"(ngon ngu: {result.get('language', '?')}).")
-        except Exception as e:
-            self.emit(f"[WHISPER][ERR] Loi khi ghi SRT cho '{media.name}': {e!r}")
 
     # ---- shared spawn ----
     def _spawn(self, cmd: list[str]) -> int:
@@ -419,6 +313,169 @@ class DownloadJob:
         return [sys.executable, "-m", "yt_dlp"]
 
 
+# ---------- SRT extraction worker (Whisper) ----------
+
+def pick_whisper_device() -> str:
+    """Uu tien GPU (CUDA) neu co, khong thi dung CPU."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+class _ProgressCapture(io.TextIOBase):
+    """Bat output tqdm cua Whisper (ghi ra stderr) de doc % tien do xu ly."""
+
+    _PCT_RE = re.compile(r"(\d{1,3})%\|")
+
+    def __init__(self, on_percent):
+        self._on_percent = on_percent
+        self._buf = ""
+
+    def write(self, s: str) -> int:
+        self._buf += s
+        *lines, self._buf = re.split(r"[\r\n]", self._buf)
+        for line in lines + [self._buf]:
+            m = self._PCT_RE.search(line)
+            if m:
+                self._on_percent(min(100, int(m.group(1))))
+        return len(s)
+
+    def flush(self) -> None:
+        pass
+
+
+class SrtJob:
+    """Tach loi thoai (.srt) tu cac file MP3/audio co san bang Whisper."""
+
+    def __init__(self, files: list[Path], settings: dict, log: queue.Queue):
+        self.files = files
+        self.settings = settings
+        self.log_q = log
+        self._stop = threading.Event()
+        self.thread: threading.Thread | None = None
+        self._model = None
+        self._device = "cpu"
+        self.ok = 0
+        self.fail = 0
+        self.skipped = 0
+
+    def emit(self, msg: str) -> None:
+        self.log_q.put(msg)
+
+    def emit_progress(self, idx: int, total: int, filename: str, percent: int) -> None:
+        self.log_q.put(("__progress__", idx, total, filename, percent))
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        try:
+            self._run()
+        except Exception as e:
+            self.emit(f"[ERR] {e!r}")
+        finally:
+            self.emit(f"[DONE] {self.ok} thanh cong, {self.skipped} bo qua, {self.fail} loi.")
+            self.log_q.put(("__finished__", "srt"))
+
+    def _run(self) -> None:
+        total = len(self.files)
+        model = self._load_model()
+        if not model:
+            self.fail = total
+            return
+        ffmpeg_dir = find_ffmpeg_dir()
+        if ffmpeg_dir:
+            os.environ["PATH"] = str(ffmpeg_dir) + os.pathsep + os.environ.get("PATH", "")
+
+        for i, media in enumerate(self.files, 1):
+            if self._stop.is_set():
+                self.emit("[STOP] Da dung theo yeu cau.")
+                return
+            self.emit("")
+            self.emit(f"[{i}/{total}] {media.name}")
+            self.emit_progress(i, total, media.name, 0)
+
+            srt_path = media.with_suffix(".srt")
+            if srt_path.exists():
+                self.emit(f"  -> Da co san {srt_path.name}, bo qua.")
+                self.skipped += 1
+                self.emit_progress(i, total, media.name, 100)
+                continue
+
+            if self._transcribe_one(media, i, total):
+                self.ok += 1
+            else:
+                self.fail += 1
+            self.emit_progress(i, total, media.name, 100)
+
+    def _load_model(self):
+        if self._model is not None:
+            return self._model
+        try:
+            import whisper  # openai-whisper
+        except Exception as e:
+            self.emit(f"[WHISPER][ERR] Chua cai openai-whisper ({e!r}). "
+                      "Chay: pip install -U openai-whisper")
+            return None
+        name = self.settings.get("whisper_model", "turbo") or "turbo"
+        device = pick_whisper_device()
+        device_label = "GPU (CUDA)" if device == "cuda" else "CPU"
+        self.emit(f"[WHISPER] Dang nap model '{name}' tren {device_label} "
+                  "(lan dau se tai model, vui long doi)...")
+        try:
+            model = whisper.load_model(name, device=device)
+        except Exception as e:
+            if device == "cuda":
+                self.emit(f"[WHISPER] Khong dung duoc GPU ({e!r}), chuyen sang CPU...")
+                try:
+                    model = whisper.load_model(name, device="cpu")
+                    device = "cpu"
+                except Exception as e2:
+                    self.emit(f"[WHISPER][ERR] Khong nap duoc model '{name}': {e2!r}")
+                    return None
+            else:
+                self.emit(f"[WHISPER][ERR] Khong nap duoc model '{name}': {e!r}")
+                return None
+        self.emit(f"[WHISPER] Nap model xong ({device_label}).")
+        self._model = model
+        self._device = device
+        return model
+
+    def _transcribe_one(self, media: Path, idx: int, total: int) -> bool:
+        lang = (self.settings.get("whisper_language") or "").strip() or None
+        fp16 = self._device == "cuda"
+
+        old_stderr = sys.stderr
+        sys.stderr = _ProgressCapture(lambda pct: self.emit_progress(idx, total, media.name, pct))
+        try:
+            result = self._model.transcribe(str(media), language=lang, fp16=fp16, verbose=False)
+        except Exception as e:
+            self.emit(f"[WHISPER][ERR] Loi khi tach '{media.name}': {e!r}")
+            return False
+        finally:
+            sys.stderr = old_stderr
+
+        try:
+            from whisper.utils import get_writer
+            writer = get_writer("srt", str(media.parent))
+            writer(result, str(media), {
+                "max_line_width": None,
+                "max_line_count": None,
+                "highlight_words": False,
+            })
+        except Exception as e:
+            self.emit(f"[WHISPER][ERR] Loi khi ghi SRT cho '{media.name}': {e!r}")
+            return False
+
+        self.emit(f"  -> Xong: {media.with_suffix('.srt').name} "
+                  f"(ngon ngu: {result.get('language', '?')}).")
+        return True
+
+
 # ---------- GUI ----------
 
 class App(tk.Tk):
@@ -434,7 +491,7 @@ class App(tk.Tk):
 
         self.settings = load_settings()
         self.log_q: queue.Queue = queue.Queue()
-        self.job: DownloadJob | None = None
+        self.job: DownloadJob | SrtJob | None = None
 
         self._build_ui()
         self._tick_log()
@@ -456,15 +513,18 @@ class App(tk.Tk):
 
         self.tab_img = ttk.Frame(self.nb)
         self.tab_reels = ttk.Frame(self.nb)
+        self.tab_srt = ttk.Frame(self.nb)
         self.tab_settings = ttk.Frame(self.nb)
         self.nb.add(self.tab_img, text="  Anh  ")
         self.nb.add(self.tab_reels, text="  Reels / Video  ")
+        self.nb.add(self.tab_srt, text="  Tach SRT  ")
         self.nb.add(self.tab_settings, text="  Cai dat  ")
 
         self._build_tab(self.tab_img, "image",
                         "Dan link Facebook (anh/album/profile), moi link 1 dong.\nDong bat dau bang # se bi bo qua.")
         self._build_tab(self.tab_reels, "reels",
                         "Dan link Reels / Video Facebook, moi link 1 dong.\nDong bat dau bang # se bi bo qua.")
+        self._build_srt_tab()
         self._build_settings_tab()
 
         # Shared log
@@ -508,19 +568,8 @@ class App(tk.Tk):
                             variable=self.reels_mode_var, value="mp3").pack(side="left", padx=(0, 12), pady=4)
             ttk.Radiobutton(mode_frame, text="Ca video + MP3",
                             variable=self.reels_mode_var, value="both").pack(side="left", padx=(0, 12), pady=4)
-
-            script_frame = ttk.LabelFrame(parent, text="Tach script (Whisper)")
-            script_frame.pack(fill="x", padx=10, pady=(0, 4))
-            self.transcribe_var = tk.BooleanVar(value=self.settings.get("transcribe_srt", False))
-            ttk.Checkbutton(script_frame, text="Tach loi thoai ra .srt bang Whisper turbo",
-                            variable=self.transcribe_var).pack(side="left", padx=(8, 12), pady=4)
-            ttk.Label(script_frame, text="Ngon ngu:").pack(side="left", padx=(6, 2))
-            self.whisper_lang_var = tk.StringVar(value=self.settings.get("whisper_language", ""))
-            lang_cb = ttk.Combobox(script_frame, textvariable=self.whisper_lang_var, width=14,
-                                   state="readonly",
-                                   values=["", "vi", "en", "ja", "ko", "zh", "fr", "es"])
-            lang_cb.pack(side="left", padx=(0, 6))
-            ttk.Label(script_frame, text="(de trong = tu dong)").pack(side="left")
+            ttk.Label(mode_frame, text="(Tach loi thoai .srt: sang tab 'Tach SRT')",
+                      foreground="#666").pack(side="left", padx=(12, 0))
 
         bar = ttk.Frame(parent)
         bar.pack(fill="x", padx=10, pady=(4, 10))
@@ -550,6 +599,71 @@ class App(tk.Tk):
         else:
             self.reels_start_btn = start_btn
             self.reels_stop_btn = stop_btn
+
+    def _build_srt_tab(self) -> None:
+        parent = self.tab_srt
+        self._srt_files: list[Path] = []
+
+        ttk.Label(parent, justify="left", text=(
+            "Chon thu muc chua cac file MP3 da tai (o tab Reels/Video), "
+            "roi chon cac file can tach loi thoai ra .srt bang Whisper."
+        )).pack(anchor="w", padx=10, pady=(10, 4))
+
+        folder_frame = ttk.Frame(parent)
+        folder_frame.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Label(folder_frame, text="Thu muc MP3:").pack(side="left")
+        self.srt_folder_var = tk.StringVar(value=self.settings.get("srt_folder", ""))
+        ttk.Entry(folder_frame, textvariable=self.srt_folder_var).pack(
+            side="left", fill="x", expand=True, padx=6)
+        ttk.Button(folder_frame, text="Chon thu muc...",
+                   command=self._pick_srt_folder).pack(side="left")
+
+        list_frame = ttk.Frame(parent)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=4)
+        self.srt_listbox = tk.Listbox(list_frame, selectmode="extended", font=("Consolas", 10))
+        self.srt_listbox.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(list_frame, orient="vertical", command=self.srt_listbox.yview)
+        sb.pack(side="right", fill="y")
+        self.srt_listbox.config(yscrollcommand=sb.set)
+
+        sel_bar = ttk.Frame(parent)
+        sel_bar.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Button(sel_bar, text="Chon tat ca", command=self._srt_select_all).pack(side="left")
+        ttk.Button(sel_bar, text="Bo chon tat ca", command=self._srt_select_none).pack(
+            side="left", padx=(6, 0))
+        self.srt_count_var = tk.StringVar(value="0 file")
+        ttk.Label(sel_bar, textvariable=self.srt_count_var).pack(side="right")
+
+        opt_frame = ttk.LabelFrame(parent, text="Whisper")
+        opt_frame.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Label(opt_frame, text="Model:").pack(side="left", padx=(8, 2))
+        self.whisper_model_var = tk.StringVar(value=self.settings.get("whisper_model", "turbo"))
+        ttk.Combobox(opt_frame, textvariable=self.whisper_model_var, width=12, state="readonly",
+                     values=["tiny", "base", "small", "medium", "large-v3", "turbo"]
+                     ).pack(side="left", padx=(0, 12))
+        ttk.Label(opt_frame, text="Ngon ngu:").pack(side="left", padx=(0, 2))
+        self.whisper_lang_var = tk.StringVar(value=self.settings.get("whisper_language", ""))
+        ttk.Combobox(opt_frame, textvariable=self.whisper_lang_var, width=14, state="readonly",
+                     values=["", "vi", "en", "ja", "ko", "zh", "fr", "es"]
+                     ).pack(side="left", padx=(0, 6))
+        ttk.Label(opt_frame, text="(de trong = tu dong nhan dien)").pack(side="left")
+
+        progress_frame = ttk.Frame(parent)
+        progress_frame.pack(fill="x", padx=10, pady=(0, 4))
+        self.srt_progress = ttk.Progressbar(progress_frame, mode="determinate", maximum=100)
+        self.srt_progress.pack(fill="x", side="top")
+        self.srt_progress_var = tk.StringVar(value="")
+        ttk.Label(progress_frame, textvariable=self.srt_progress_var).pack(anchor="w", pady=(2, 0))
+
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", padx=10, pady=(4, 10))
+        self.srt_start_btn = ttk.Button(bar, text="Bat dau tach", command=self._start_srt)
+        self.srt_start_btn.pack(side="left")
+        self.srt_stop_btn = ttk.Button(bar, text="Dung", command=self._stop, state="disabled")
+        self.srt_stop_btn.pack(side="left", padx=(6, 0))
+
+        if self.srt_folder_var.get():
+            self._scan_srt_folder(select_all=True)
 
     def _build_settings_tab(self) -> None:
         f = ttk.Frame(self.tab_settings, padding=14)
@@ -602,14 +716,38 @@ class App(tk.Tk):
         else:
             subprocess.Popen(["xdg-open", str(out)])
 
+    def _pick_srt_folder(self):
+        d = filedialog.askdirectory(
+            initialdir=self.srt_folder_var.get() or self.out_var.get() or str(CONFIG_DIR))
+        if d:
+            self.srt_folder_var.set(d)
+            self._scan_srt_folder(select_all=True)
+
+    def _scan_srt_folder(self, select_all: bool = False):
+        folder = Path(self.srt_folder_var.get())
+        self.srt_listbox.delete(0, "end")
+        self._srt_files = sorted(folder.glob("*.mp3")) if folder.is_dir() else []
+        for f in self._srt_files:
+            self.srt_listbox.insert("end", f.name)
+        self.srt_count_var.set(f"{len(self._srt_files)} file")
+        if select_all:
+            self._srt_select_all()
+
+    def _srt_select_all(self):
+        self.srt_listbox.select_set(0, "end")
+
+    def _srt_select_none(self):
+        self.srt_listbox.select_clear(0, "end")
+
     def _collect_settings(self) -> dict:
         s = dict(self.settings)
         s["output_dir"] = self.out_var.get().strip() or str(DEFAULT_DOWNLOADS)
         s["cookies_path"] = self.cookies_var.get().strip() or str(DEFAULT_COOKIES)
         s["download_videos_with_images"] = bool(self.videos_var.get())
         s["reels_mode"] = self.reels_mode_var.get()
-        s["transcribe_srt"] = bool(self.transcribe_var.get())
+        s["whisper_model"] = self.whisper_model_var.get().strip() or "turbo"
         s["whisper_language"] = self.whisper_lang_var.get().strip()
+        s["srt_folder"] = self.srt_folder_var.get().strip()
         s["image_links"] = self.img_text.get("1.0", "end-1c")
         s["reels_links"] = self.reels_text.get("1.0", "end-1c")
         return s
@@ -648,21 +786,45 @@ class App(tk.Tk):
         self.job.thread = threading.Thread(target=self.job.run, daemon=True)
         self.job.thread.start()
 
+    def _start_srt(self):
+        if self.job is not None:
+            messagebox.showinfo(APP_NAME, "Dang co mot tac vu chay. Dung truoc khi chay tac vu moi.")
+            return
+
+        s = self._collect_settings()
+        self.settings = s
+        save_settings(s)
+
+        sel = self.srt_listbox.curselection()
+        if not sel:
+            messagebox.showwarning(APP_NAME, "Chua chon file MP3 nao (bam 'Chon tat ca' de chon het).")
+            return
+        files = [self._srt_files[i] for i in sel]
+
+        self._append_log(f"==> Bat dau tach SRT cho {len(files)} file")
+        self.status_var.set("Dang tach SRT...")
+        self.srt_progress.config(value=0)
+        self.srt_progress_var.set("")
+
+        self._set_buttons_running("srt", True)
+
+        self.job = SrtJob(files, s, self.log_q)
+        self.job.thread = threading.Thread(target=self.job.run, daemon=True)
+        self.job.thread.start()
+
     def _stop(self):
         if self.job:
             self.job.stop()
             self.status_var.set("Dang dung...")
 
     def _set_buttons_running(self, kind: str, running: bool):
-        if kind == "image":
-            self.img_start_btn.config(state="disabled" if running else "normal")
-            self.img_stop_btn.config(state="normal" if running else "disabled")
-            # also disable reels start while image is running
-            self.reels_start_btn.config(state="disabled" if running else "normal")
-        else:
-            self.reels_start_btn.config(state="disabled" if running else "normal")
-            self.reels_stop_btn.config(state="normal" if running else "disabled")
-            self.img_start_btn.config(state="disabled" if running else "normal")
+        other_state = "disabled" if running else "normal"
+        self.img_start_btn.config(state=other_state)
+        self.reels_start_btn.config(state=other_state)
+        self.srt_start_btn.config(state=other_state)
+        self.img_stop_btn.config(state="normal" if (running and kind == "image") else "disabled")
+        self.reels_stop_btn.config(state="normal" if (running and kind == "reels") else "disabled")
+        self.srt_stop_btn.config(state="normal" if (running and kind == "srt") else "disabled")
 
     def _append_log(self, msg: str):
         self.log_widget.config(state="normal")
@@ -675,8 +837,14 @@ class App(tk.Tk):
         try:
             while True:
                 item = self.log_q.get_nowait()
-                if isinstance(item, tuple) and item and item[0] == "__finished__":
-                    finished_kind = item[1]
+                if isinstance(item, tuple) and item:
+                    if item[0] == "__finished__":
+                        finished_kind = item[1]
+                    elif item[0] == "__progress__":
+                        _, idx, total, filename, percent = item
+                        overall = ((idx - 1) * 100 + percent) / total if total else 0
+                        self.srt_progress.config(value=overall)
+                        self.srt_progress_var.set(f"File {idx}/{total}: {filename} - {percent}%")
                 else:
                     self._append_log(str(item))
         except queue.Empty:
