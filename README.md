@@ -32,7 +32,35 @@ Trong tab **Reels / Video**, tick **"Tách lời thoại ra .srt bằng Whisper 
 - Chọn **Ngôn ngữ** nếu biết trước (vd `vi`, `en`); để trống = tự động nhận diện.
 - **Lần đầu** dùng sẽ tải model `turbo` (~1.5 GB) về cache (`%USERPROFILE%\.cache\whisper`), cần mạng. Các lần sau dùng lại cache, không tải nữa.
 - Whisper cũng cần **ffmpeg** để đọc audio (đã nói ở trên).
-- Chạy trên CPU (bản đóng gói không kèm CUDA) nên clip dài sẽ mất thời gian.
+- App **tự dùng GPU NVIDIA nếu có**, không có thì rơi về CPU. Log sẽ ghi rõ `[WHISPER] GPU: ...` kèm dung lượng VRAM,
+  và cảnh báo nếu model đã chọn không vừa VRAM.
+
+#### Bật GPU
+
+`pip install openai-whisper` chỉ kéo về torch bản **CPU-only**, nên mặc định GPU không hề được dùng. Muốn bật:
+
+```powershell
+pip install torch==2.11.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+python -c "import torch; print(torch.cuda.is_available())"   # phải in True
+```
+
+Dùng `cu126` cho card GTX 10xx (Pascal, `sm_61`) — bản `cu128`/`cu130` đã bỏ hỗ trợ Pascal.
+Đổi lại, torch CUDA nặng ~4 GB (bản CPU chỉ 448 MB), nên thư mục `dist/` sau khi build sẽ phồng từ ~700 MB lên **~4 GB**.
+
+#### Chọn model theo VRAM
+
+Điều quyết định tốc độ **không phải** GPU mạnh hay yếu, mà là **model có vừa VRAM hay không**. Vượt VRAM thì phải tràn
+sang RAM hệ thống qua PCIe và chậm hẳn. Số đo thật trên GTX 1050 Ti 4 GB + i7-8700, với 120 giây audio tiếng Anh:
+
+| Model | VRAM đỉnh | CPU | GPU | GPU nhanh hơn |
+|---|---|---|---|---|
+| `small` | 1.4 GB — vừa | 46.7s (2.6x realtime) | **19.1s (6.3x realtime)** | 2.4x |
+| `turbo` | 4.6 GB — tràn | 107.7s (1.1x realtime) | 56.4s (2.1x realtime) | 1.9x |
+| `medium` | 4.3 GB — tràn | 128.9s (0.9x realtime) | 86.8s (1.4x realtime) | 1.5x |
+
+Nghĩa là trên card 4 GB, `small` chạy GPU nhanh gấp **5.6 lần** `turbo` chạy CPU (file 20 phút: ~3 phút thay vì ~18 phút),
+đổi lại độ chính xác thấp hơn `turbo`. Card từ 6 GB trở lên thì `turbo` vừa VRAM và sẽ nhanh hơn hẳn.
+
 
 ### Định dạng link hỗ trợ
 
@@ -84,7 +112,16 @@ Script này sẽ:
 
 ## Troubleshooting
 
-- **`HttpError: 401 / 403`** → cookies hết hạn, export lại `cookies.txt`.
+- **`HTTP Error 403: Forbidden` khi tải YouTube/Reels** → gần như luôn là do `yt-dlp` đã cũ
+  (YouTube đổi cơ chế liên tục). Cách sửa nhanh, **không cần build lại app**: tải
+  [`yt-dlp.exe` bản mới nhất](https://github.com/yt-dlp/yt-dlp/releases/latest) đặt cạnh file
+  `FB_Downloader.exe` (hoặc chạy `yt-dlp.exe -U`). App tự so sánh phiên bản và luôn dùng bản mới hơn
+  giữa file rời và bản đóng gói bên trong — dòng `[YT-DLP] Dung: ...` trong log cho biết nó đang dùng bản nào.
+- **Log báo `No supported JavaScript runtime could be found`** → cài
+  [Deno](https://deno.com) hoặc [Node](https://nodejs.org) (hoặc bỏ `deno.exe`/`node.exe` cạnh app).
+  yt-dlp cần JS runtime để giải challenge của YouTube; thiếu nó sẽ mất một số format hoặc dính 403.
+  Log sẽ hiện `[JS] Dung JavaScript runtime: ...` khi đã tìm thấy.
+- **`HttpError: 401 / 403` khi tải ảnh Facebook** → cookies hết hạn, export lại `cookies.txt`.
 - **`No suitable extractor`** → link không đúng định dạng. Mở link trong browser, copy URL thật rồi dán lại.
 - **App không mở được** → chạy thử bằng Python xem có lỗi gì:
   ```powershell
@@ -96,4 +133,6 @@ Script này sẽ:
 
 ## Legacy
 
-Các file `download.ps1`, `download_image.bat`, `download_reels.bat`, `yt-dlp.exe` của phiên bản cũ vẫn để lại để bạn xem tham khảo hoặc fallback. Sau khi xác nhận exe mới chạy ổn có thể xoá đi.
+Các file `download.ps1`, `download_image.bat`, `download_reels.bat` của phiên bản cũ vẫn để lại để bạn xem tham khảo hoặc fallback. Sau khi xác nhận exe mới chạy ổn có thể xoá đi.
+
+`yt-dlp.exe` thì **nên giữ lại và cập nhật thường xuyên** (`yt-dlp.exe -U`): app ưu tiên dùng bản mới hơn giữa nó và bản đóng gói bên trong, nên đây là cách vá lỗi YouTube 403 mà không phải build lại.

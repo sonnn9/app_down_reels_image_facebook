@@ -10,6 +10,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -123,6 +124,109 @@ def find_ffmpeg_dir() -> Path | None:
     return None
 
 
+YTDLP_EXE = "yt-dlp.exe" if sys.platform == "win32" else "yt-dlp"
+
+# yt-dlp phai duoc cap nhat lien tuc (YouTube doi co che thuong xuyen). Ket qua do
+# tim duoc cache lai de khong phai spawn subprocess moi lan tai.
+_ytdlp_choice: tuple[list[str], str] | None = None
+
+
+def _version_key(ver: str) -> tuple[int, ...]:
+    """'2026.08.19' -> (2026, 8, 19) de so sanh phien ban yt-dlp."""
+    out = []
+    for chunk in ver.strip().split("."):
+        m = re.match(r"\d+", chunk)
+        out.append(int(m.group()) if m else 0)
+    return tuple(out)
+
+
+def _exe_version(exe: Path) -> str | None:
+    try:
+        res = subprocess.run(
+            [str(exe), "--version"],
+            capture_output=True, text=True, timeout=30,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return None
+    lines = [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()]
+    return lines[-1] if res.returncode == 0 and lines else None
+
+
+def _bundled_ytdlp_version() -> str | None:
+    try:
+        from yt_dlp.version import __version__
+        return __version__
+    except Exception:
+        return None
+
+
+def _module_ytdlp_invoker() -> list[str]:
+    """Chay yt-dlp dong goi ben trong exe (hoac module cua python trong dev)."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--__run_module__", "yt_dlp"]
+    return [sys.executable, "-m", "yt_dlp"]
+
+
+def find_ytdlp_exe() -> Path | None:
+    """Tim yt-dlp.exe roi: canh app, trong bin/, roi den PATH."""
+    for cand in (CONFIG_DIR / YTDLP_EXE, CONFIG_DIR / "bin" / YTDLP_EXE):
+        if cand.exists():
+            return cand
+    found = shutil.which(YTDLP_EXE)
+    return Path(found) if found else None
+
+
+def resolve_ytdlp() -> tuple[list[str], str]:
+    """Chon ban yt-dlp MOI hon giua file roi canh app va ban dong goi trong exe.
+
+    Uu tien ban moi hon vi YouTube lien tuc lam hong cac ban yt-dlp cu (HTTP 403).
+    Nho vay chi can chay `yt-dlp.exe -U` canh app la sua duoc, khong phai build lai.
+    """
+    global _ytdlp_choice
+    if _ytdlp_choice is not None:
+        return _ytdlp_choice
+
+    bundled_ver = _bundled_ytdlp_version()
+    exe = find_ytdlp_exe()
+    exe_ver = _exe_version(exe) if exe else None
+
+    use_exe = exe is not None and (
+        bundled_ver is None
+        or (exe_ver is not None and _version_key(exe_ver) >= _version_key(bundled_ver))
+    )
+    if use_exe:
+        _ytdlp_choice = ([str(exe)], f"{exe} ({exe_ver or 'khong ro phien ban'})")
+    else:
+        _ytdlp_choice = (
+            _module_ytdlp_invoker(),
+            f"ban dong goi trong app ({bundled_ver or 'khong ro phien ban'})",
+        )
+    return _ytdlp_choice
+
+
+# Theo thu tu uu tien cua yt-dlp: deno > node > bun.
+JS_RUNTIME_NAMES = ("deno", "node", "bun")
+
+
+def find_js_runtime() -> tuple[str, Path] | None:
+    """Tim JS runtime cho yt-dlp (deno/node/bun): canh app, bin/, roi PATH.
+
+    yt-dlp can JS runtime de giai challenge cua YouTube; thieu no thi mot so format
+    bi bo qua va link tai co the tra ve HTTP 403.
+    """
+    suffix = ".exe" if sys.platform == "win32" else ""
+    for name in JS_RUNTIME_NAMES:
+        exe = name + suffix
+        for cand in (CONFIG_DIR / exe, CONFIG_DIR / "bin" / exe):
+            if cand.exists():
+                return name, cand
+        found = shutil.which(exe)
+        if found:
+            return name, Path(found)
+    return None
+
+
 def ensure_gallery_conf() -> Path:
     """Make sure gallery-dl.conf exists next to the exe; copy from bundle if not."""
     if GALLERY_CONF.exists():
@@ -222,12 +326,21 @@ class DownloadJob:
     def _run_reels(self) -> None:
         out_dir = Path(self.settings["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
-        cmd_base = self._ytdlp_invoker()
+        cmd_base, ytdlp_desc = resolve_ytdlp()
         cookies = Path(self.settings["cookies_path"])
         mode = self.settings.get("reels_mode", "video")
 
         mode_label = {"video": "chi video", "mp3": "chi MP3", "both": "video + MP3"}.get(mode, mode)
         self.emit(f"[MODE] Che do tai: {mode_label}. Ten file theo title video.")
+        self.emit(f"[YT-DLP] Dung: {ytdlp_desc}")
+
+        js_runtime = find_js_runtime()
+        if js_runtime:
+            js_name, js_path = js_runtime
+            self.emit(f"[JS] Dung JavaScript runtime: {js_name} ({js_path})")
+        else:
+            self.emit("[NOTE] Khong thay JavaScript runtime (deno/node). YouTube co the thieu format "
+                      "hoac bao HTTP 403. Cai Deno (https://deno.com) hoac Node roi chay lai.")
 
         ffmpeg_dir = find_ffmpeg_dir()
         if mode in ("mp3", "both"):
@@ -261,6 +374,8 @@ class DownloadJob:
             # mode == "video": mac dinh tai video (best video+audio).
             if mode in ("mp3", "both") and ffmpeg_dir:
                 cmd += ["--ffmpeg-location", str(ffmpeg_dir)]
+            if js_runtime:
+                cmd += ["--js-runtimes", f"{js_runtime[0]}:{js_runtime[1]}"]
             if cookies.exists():
                 cmd += ["--cookies", str(cookies)]
             cmd += [url]
@@ -271,6 +386,10 @@ class DownloadJob:
             else:
                 self.fail += 1
                 self.emit(f"  -> exit code {rc}")
+                if self.fail == 1:
+                    self.emit("[GOI Y] Loi kieu 'HTTP Error 403' hay 'Requested format is not available' "
+                              "thuong la do yt-dlp da cu. Copy yt-dlp.exe moi nhat vao canh app "
+                              "(hoac chay `yt-dlp.exe -U`) roi tai lai.")
 
     # ---- shared spawn ----
     def _spawn(self, cmd: list[str]) -> int:
@@ -307,11 +426,6 @@ class DownloadJob:
         # Dev mode: use current Python.
         return [sys.executable, "-m", "gallery_dl"]
 
-    def _ytdlp_invoker(self) -> list[str]:
-        if getattr(sys, "frozen", False):
-            return [sys.executable, "--__run_module__", "yt_dlp"]
-        return [sys.executable, "-m", "yt_dlp"]
-
 
 # ---------- SRT extraction worker (Whisper) ----------
 
@@ -324,6 +438,40 @@ def pick_whisper_device() -> str:
     except Exception:
         pass
     return "cpu"
+
+
+def gpu_info() -> tuple[str, float] | None:
+    """Ten GPU + dung luong VRAM (GB), hoac None neu khong co CUDA."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        props = torch.cuda.get_device_properties(0)
+        return props.name, props.total_memory / 1024 ** 3
+    except Exception:
+        return None
+
+
+# VRAM cao nhat (GB) do duoc thuc te khi chay openai-whisper fp32 tren card 4 GB.
+# Model nao vuot qua VRAM cua card se bi tran sang RAM he thong va cham han di.
+WHISPER_PEAK_VRAM_GB = {
+    "tiny": 0.5, "base": 0.8, "small": 1.4, "medium": 4.3,
+    "turbo": 4.6, "large-v3-turbo": 4.6,
+    "large": 8.5, "large-v1": 8.5, "large-v2": 8.5, "large-v3": 8.5,
+}
+
+
+def whisper_vram_need(model_name: str) -> float | None:
+    """VRAM uoc tinh cho model Whisper, None neu khong biet ten model."""
+    return WHISPER_PEAK_VRAM_GB.get(model_name.strip().lower().removesuffix(".en"))
+
+
+def suggest_smaller_model(vram_gb: float) -> str | None:
+    """Model lon nhat con vua VRAM cua card."""
+    for name in ("turbo", "medium", "small", "base", "tiny"):
+        if WHISPER_PEAK_VRAM_GB[name] <= vram_gb:
+            return name
+    return None
 
 
 class _ProgressCapture(io.TextIOBase):
@@ -424,6 +572,21 @@ class SrtJob:
         name = self.settings.get("whisper_model", "turbo") or "turbo"
         device = pick_whisper_device()
         device_label = "GPU (CUDA)" if device == "cuda" else "CPU"
+        if device == "cuda":
+            info = gpu_info()
+            if info:
+                gpu_name, vram = info
+                self.emit(f"[WHISPER] GPU: {gpu_name} ({vram:.1f} GB VRAM)")
+                need = whisper_vram_need(name)
+                if need and need > vram:
+                    smaller = suggest_smaller_model(vram)
+                    hint = f" Doi sang model '{smaller}' se nhanh hon dang ke." if smaller else ""
+                    self.emit(f"[WHISPER] Canh bao: model '{name}' can khoang {need:.1f} GB VRAM "
+                              f"nhung card chi co {vram:.1f} GB -> phai tran sang RAM he thong "
+                              f"va chay cham.{hint}")
+        else:
+            self.emit("[WHISPER] Khong thay GPU CUDA -> chay tren CPU (cham hon nhieu). "
+                      "Neu may co card NVIDIA, cai torch ban CUDA: xem README.")
         self.emit(f"[WHISPER] Dang nap model '{name}' tren {device_label} "
                   "(lan dau se tai model, vui long doi)...")
         try:
@@ -434,6 +597,7 @@ class SrtJob:
                 try:
                     model = whisper.load_model(name, device="cpu")
                     device = "cpu"
+                    device_label = "CPU"
                 except Exception as e2:
                     self.emit(f"[WHISPER][ERR] Khong nap duoc model '{name}': {e2!r}")
                     return None

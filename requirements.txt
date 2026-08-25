@@ -1,4 +1,11 @@
 gallery-dl>=1.27
-yt-dlp>=2024.1.1
+yt-dlp>=2026.8.19
+yt-dlp-ejs>=0.8.0
 pyinstaller>=6.0
 openai-whisper>=20240930
+
+# openai-whisper keo theo torch, nhung pip mac dinh cai ban CPU-only.
+# Muon tach SRT bang GPU NVIDIA thi cai torch ban CUDA RIENG sau khi chay file nay:
+#   pip install torch==2.11.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+# Dung cu126 cho card GTX 10xx (Pascal, sm_61) - ban cu128/cu130 da bo ho tro Pascal.
+# Kiem tra: python -c "import torch; print(torch.cuda.is_available())" 

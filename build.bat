@@ -22,6 +22,7 @@ if exist FB_Downloader.spec del /q FB_Downloader.spec
 
 echo.
 echo ==^> Build (onedir vi co PyTorch/Whisper, no console)...
+echo     Luu y: neu dang cai torch ban CUDA, thu muc dist se nang ~4GB thay vi ~700MB.
 "%PYTHON%" -m PyInstaller ^
     --noconfirm ^
     --onedir ^
@@ -30,6 +31,7 @@ echo ==^> Build (onedir vi co PyTorch/Whisper, no console)...
     --add-data "gallery-dl.conf;." ^
     --collect-all gallery_dl ^
     --collect-all yt_dlp ^
+    --collect-all yt_dlp_ejs ^
     --collect-all whisper ^
     --collect-all tiktoken ^
     --collect-all tiktoken_ext ^
@@ -37,6 +39,7 @@ echo ==^> Build (onedir vi co PyTorch/Whisper, no console)...
     --collect-all numba ^
     --hidden-import gallery_dl ^
     --hidden-import yt_dlp ^
+    --hidden-import yt_dlp_ejs ^
     --hidden-import whisper ^
     src\fb_downloader.py
 
