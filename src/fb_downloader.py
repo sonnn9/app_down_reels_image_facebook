@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -57,11 +58,24 @@ DEFAULT_SETTINGS = {
     "cookies_path": str(DEFAULT_COOKIES),
     "download_videos_with_images": False,
     "reels_mode": "video",  # "video" | "mp3" | "both"
+    "video_quality": "h264_1080",  # key trong VIDEO_QUALITIES
     "whisper_model": "turbo",     # ten model Whisper (turbo = large-v3-turbo)
     "whisper_language": "",       # "" = tu dong nhan dien; vd "vi", "en"
     "srt_folder": "",             # thu muc chua file MP3 de tach SRT (tab rieng)
     "image_links": "",
     "reels_links": "",
+}
+
+
+# Dinh dang video khi tai Reels: key -> (nhan hien thi, chuoi sort -S cua yt-dlp).
+# H.264 + AAC (m4a) trong mp4 phat duoc tren hau het TV ma khong can convert.
+# -S chi uu tien (khong ep): Facebook Reels thuong chi co AV1/VP9 o 1080p (H.264 chi
+# co ban 360p), nen voi cac lua chon TV app se tu chuyen sang H.264 sau khi tai.
+# res dat truoc vcodec de khong bi tut xuong ban H.264 do phan giai thap.
+VIDEO_QUALITIES = {
+    "h264_1080": ("TV: H.264 1080p + M4A (mp4)", "res:1080,vcodec:h264,acodec:m4a"),
+    "h264_720": ("TV: H.264 720p + M4A (mp4)", "res:720,vcodec:h264,acodec:m4a"),
+    "best": ("Tot nhat (giu nguyen, co the VP9/AV1)", None),
 }
 
 
@@ -122,6 +136,35 @@ def find_ffmpeg_dir() -> Path | None:
         if (cand / FFMPEG_EXE).exists():
             return cand
     return None
+
+
+def resolve_ffmpeg(ffmpeg_dir: Path | None) -> str | None:
+    if ffmpeg_dir:
+        return str(ffmpeg_dir / FFMPEG_EXE)
+    return shutil.which("ffmpeg")
+
+
+def probe_codecs(ffmpeg: str, path: Path) -> tuple[str | None, str | None]:
+    """(video codec, audio codec) cua file, doc tu output `ffmpeg -i` (khong can ffprobe)."""
+    try:
+        res = subprocess.run(
+            [ffmpeg, "-hide_banner", "-i", str(path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60, creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return None, None
+    v = re.search(r"Stream #.*?Video: (\w+)", res.stderr or "")
+    a = re.search(r"Stream #.*?Audio: (\w+)", res.stderr or "")
+    return (v.group(1) if v else None, a.group(1) if a else None)
+
+
+# Thu GPU NVIDIA truoc (nhanh), loi thi chuyen sang CPU.
+H264_ENCODERS = [
+    ("GPU NVENC", ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "21", "-b:v", "0",
+                   "-pix_fmt", "yuv420p"]),
+    ("CPU libx264", ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"]),
+]
 
 
 YTDLP_EXE = "yt-dlp.exe" if sys.platform == "win32" else "yt-dlp"
@@ -329,9 +372,16 @@ class DownloadJob:
         cmd_base, ytdlp_desc = resolve_ytdlp()
         cookies = Path(self.settings["cookies_path"])
         mode = self.settings.get("reels_mode", "video")
+        quality = self.settings.get("video_quality", "h264_1080")
+        if quality not in VIDEO_QUALITIES:
+            quality = "h264_1080"
+        quality_label, quality_sort = VIDEO_QUALITIES[quality]
+        want_tv = mode in ("video", "both") and quality_sort is not None
 
         mode_label = {"video": "chi video", "mp3": "chi MP3", "both": "video + MP3"}.get(mode, mode)
         self.emit(f"[MODE] Che do tai: {mode_label}. Ten file theo title video.")
+        if mode in ("video", "both"):
+            self.emit(f"[FORMAT] Dinh dang video: {quality_label}")
         self.emit(f"[YT-DLP] Dung: {ytdlp_desc}")
 
         js_runtime = find_js_runtime()
@@ -343,12 +393,17 @@ class DownloadJob:
                       "hoac bao HTTP 403. Cai Deno (https://deno.com) hoac Node roi chay lai.")
 
         ffmpeg_dir = find_ffmpeg_dir()
-        if mode in ("mp3", "both"):
+        # MP3 can ffmpeg de chuyen am thanh; dinh dang TV can ffmpeg de ghep mp4 / chuyen H.264.
+        if mode in ("mp3", "both") or want_tv:
             if ffmpeg_dir:
                 self.emit(f"[FFMPEG] Dung ffmpeg tai: {ffmpeg_dir}")
             else:
                 self.emit("[NOTE] Khong thay ffmpeg.exe canh app -> dung ffmpeg trong PATH. "
-                          "Neu loi MP3, copy ffmpeg.exe (va ffprobe.exe) vao canh file exe.")
+                          "Neu loi MP3/ghep mp4, copy ffmpeg.exe (va ffprobe.exe) vao canh file exe.")
+        ffmpeg = resolve_ffmpeg(ffmpeg_dir) if want_tv else None
+        if want_tv and not ffmpeg:
+            self.emit("[NOTE] Khong tim thay ffmpeg -> khong chuyen duoc sang H.264. "
+                      "File AV1/VP9 co the khong phat duoc tren TV.")
 
         for i, url in enumerate(self.links, 1):
             if self._stop.is_set():
@@ -371,8 +426,15 @@ class DownloadJob:
             elif mode == "both":
                 # Tai video, dong thoi tach ra file MP3 (giu ca hai).
                 cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0", "--keep-video"]
-            # mode == "video": mac dinh tai video (best video+audio).
-            if mode in ("mp3", "both") and ffmpeg_dir:
+            paths_file = None
+            if want_tv:
+                cmd += ["-S", quality_sort, "--merge-output-format", "mp4"]
+            if want_tv or mode == "both":
+                # Ghi lai duong dan file video (truoc buoc tach MP3) de chuyen H.264 / don file sau.
+                fd, paths_file = tempfile.mkstemp(prefix="fbdl_", suffix=".txt")
+                os.close(fd)
+                cmd += ["--print-to-file", "post_process:filepath", paths_file]
+            if ffmpeg_dir:
                 cmd += ["--ffmpeg-location", str(ffmpeg_dir)]
             if js_runtime:
                 cmd += ["--js-runtimes", f"{js_runtime[0]}:{js_runtime[1]}"]
@@ -381,6 +443,19 @@ class DownloadJob:
             cmd += [url]
 
             rc = self._spawn(cmd)
+            if rc == 0 and paths_file:
+                for video in self._read_paths(paths_file):
+                    if mode == "both":
+                        self._remove_format_parts(video)
+                    if self._stop.is_set() or not ffmpeg:
+                        continue
+                    if not self._make_tv_compatible(video, ffmpeg):
+                        rc = 1
+            if paths_file:
+                try:
+                    os.remove(paths_file)
+                except OSError:
+                    pass
             if rc == 0:
                 self.ok += 1
             else:
@@ -390,6 +465,68 @@ class DownloadJob:
                     self.emit("[GOI Y] Loi kieu 'HTTP Error 403' hay 'Requested format is not available' "
                               "thuong la do yt-dlp da cu. Copy yt-dlp.exe moi nhat vao canh app "
                               "(hoac chay `yt-dlp.exe -U`) roi tai lai.")
+
+    @staticmethod
+    def _read_paths(paths_file: str) -> list[Path]:
+        try:
+            lines = Path(paths_file).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return []
+        out = []
+        for ln in lines:
+            p = Path(ln.strip())
+            if ln.strip() and p.exists() and p not in out:
+                out.append(p)
+        return out
+
+    def _remove_format_parts(self, video: Path) -> None:
+        """--keep-video (che do video + MP3) giu ca file mang truoc khi ghep
+        ('<ten>.f<format_id>.<ext>'); xoa chung, chi giu file video da ghep."""
+        prefix = video.stem + ".f"
+        for f in video.parent.iterdir():
+            if f != video and f.name.startswith(prefix) and re.fullmatch(r"[\w-]+\.\w+", f.name[len(prefix):]):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+
+    def _make_tv_compatible(self, video: Path, ffmpeg: str) -> bool:
+        """Dam bao file la H.264 + AAC trong mp4; chuyen ma neu can. True neu thanh cong."""
+        vcodec, acodec = probe_codecs(ffmpeg, video)
+        if vcodec == "h264" and acodec in ("aac", None) and video.suffix.lower() == ".mp4":
+            self.emit(f"[TV] Da la H.264 + AAC, khong can chuyen: {video.name}")
+            return True
+
+        self.emit(f"[TV] Video dang la {vcodec or '?'} / {acodec or '?'} -> chuyen sang H.264 + AAC (mp4)...")
+        final = video.with_suffix(".mp4")
+        tmp = video.with_name(video.stem + ".tv-tmp.mp4")
+        audio_args = ["-c:a", "copy"] if acodec == "aac" else ["-c:a", "aac", "-b:a", "192k"]
+        video_encoders = [("copy", ["-c:v", "copy"])] if vcodec == "h264" else H264_ENCODERS
+
+        for enc_name, enc_args in video_encoders:
+            if self._stop.is_set():
+                break
+            started = time.time()
+            rc = self._spawn([
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(video),
+                "-map", "0:v:0", "-map", "0:a:0?", *enc_args,
+                *audio_args, "-movflags", "+faststart", str(tmp),
+            ])
+            if rc == 0 and tmp.exists():
+                try:
+                    os.replace(tmp, final)
+                    if final != video:
+                        video.unlink(missing_ok=True)
+                except OSError as e:
+                    self.emit(f"[TV][ERR] Khong ghi de duoc file: {e}")
+                    return False
+                self.emit(f"[TV] Xong ({enc_name}, {time.time() - started:.0f}s): {final.name}")
+                return True
+            self.emit(f"[TV] {enc_name} loi (exit {rc}), thu cach khac...")
+
+        tmp.unlink(missing_ok=True)
+        self.emit(f"[TV][ERR] Khong chuyen duoc sang H.264: {video.name}")
+        return False
 
     # ---- shared spawn ----
     def _spawn(self, cmd: list[str]) -> int:
@@ -735,6 +872,16 @@ class App(tk.Tk):
             ttk.Label(mode_frame, text="(Tach loi thoai .srt: sang tab 'Tach SRT')",
                       foreground="#666").pack(side="left", padx=(12, 0))
 
+            quality_frame = ttk.LabelFrame(parent, text="Dinh dang video")
+            quality_frame.pack(fill="x", padx=10, pady=(0, 4))
+            quality = self.settings.get("video_quality", "h264_1080")
+            if quality not in VIDEO_QUALITIES:
+                quality = "h264_1080"
+            self.video_quality_var = tk.StringVar(value=quality)
+            for key, (label, _args) in VIDEO_QUALITIES.items():
+                ttk.Radiobutton(quality_frame, text=label, variable=self.video_quality_var,
+                                value=key).pack(side="left", padx=(8, 12), pady=4)
+
         bar = ttk.Frame(parent)
         bar.pack(fill="x", padx=10, pady=(4, 10))
 
@@ -909,6 +1056,7 @@ class App(tk.Tk):
         s["cookies_path"] = self.cookies_var.get().strip() or str(DEFAULT_COOKIES)
         s["download_videos_with_images"] = bool(self.videos_var.get())
         s["reels_mode"] = self.reels_mode_var.get()
+        s["video_quality"] = self.video_quality_var.get()
         s["whisper_model"] = self.whisper_model_var.get().strip() or "turbo"
         s["whisper_language"] = self.whisper_lang_var.get().strip()
         s["srt_folder"] = self.srt_folder_var.get().strip()

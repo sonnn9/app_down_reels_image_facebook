@@ -17,13 +17,15 @@ App GUI tải **ảnh** và **Reels/Video** từ Facebook. Đóng gói thành 1 
 3. **Chạy `FB_Downloader.exe`**.
 4. Trong app:
    - Tab **Ảnh**: dán link FB (ảnh/album/profile/post), mỗi dòng 1 link → bấm **Bắt đầu tải**.
-   - Tab **Reels / Video**: dán link reels/video → chọn **Tải gì?** (Chỉ video / Chỉ MP3 / Cả hai) → bấm **Bắt đầu tải**. Tên file đặt theo **title** của video.
+   - Tab **Reels / Video**: dán link reels/video → chọn **Tải gì?** (Chỉ video / Chỉ MP3 / Cả hai) và **Định dạng video** → bấm **Bắt đầu tải**. Tên file đặt theo **title** của video.
+     - *TV: H.264 1080p / 720p + M4A (mp4)* (mặc định): file phát thẳng trên TV. Facebook Reels thường chỉ có AV1/VP9 ở 1080p (H.264 chỉ có bản 360p), nên sau khi tải app tự chuyển sang H.264 + AAC bằng ffmpeg (ưu tiên GPU NVIDIA – NVENC, không có thì dùng CPU). File đã là H.264 thì giữ nguyên.
+     - *Tốt nhất*: giữ nguyên định dạng gốc (có thể AV1/VP9), không chuyển.
    - Tab **Cài đặt**: đổi thư mục lưu, đường dẫn `cookies.txt`, bật tùy chọn tải video kèm ảnh.
    - Bấm **Mở thư mục tải về** để xem kết quả.
 
 Link và cài đặt được tự lưu vào `fb_downloader_settings.json` cạnh exe, lần sau mở lại không phải dán lại.
 
-> **Tải MP3 cần ffmpeg.** Chế độ *Chỉ MP3* và *Cả hai* dùng ffmpeg để tách/chuyển âm thanh. App tự dò `ffmpeg.exe` (và `ffprobe.exe`) theo thứ tự: cạnh file exe → thư mục `bin/` cạnh exe → `PATH` của máy. Nếu máy đích chưa có ffmpeg, tải bản Windows từ https://www.gyan.dev/ffmpeg/builds/ rồi copy `ffmpeg.exe` + `ffprobe.exe` vào cạnh `FB_Downloader.exe`. Chế độ *Chỉ video* không cần ffmpeg.
+> **Tải MP3 cần ffmpeg.** Chế độ *Chỉ MP3* và *Cả hai* dùng ffmpeg để tách/chuyển âm thanh. App tự dò `ffmpeg.exe` (và `ffprobe.exe`) theo thứ tự: cạnh file exe → thư mục `bin/` cạnh exe → `PATH` của máy. Nếu máy đích chưa có ffmpeg, tải bản Windows từ https://www.gyan.dev/ffmpeg/builds/ rồi copy `ffmpeg.exe` + `ffprobe.exe` vào cạnh `FB_Downloader.exe`. Định dạng *TV: H.264* cũng cần ffmpeg (ghép mp4 và chuyển sang H.264); chỉ *Chỉ video* + *Tốt nhất* là không cần.
 
 ### Tách script (Whisper)
 
